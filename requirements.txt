@@ -1,0 +1,7 @@
+PyAutoGUI==0.9.54
+PyGetWindow==0.0.9
+Pillow==13.0.0
+opencv-python==5.1.0.95
+numpy==2.4.6
+pytesseract==0.3.13
+keyboard==0.13.5
