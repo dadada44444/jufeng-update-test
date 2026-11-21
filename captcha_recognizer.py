@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-雷电模拟器验证码自动识别桌面软件 - 窗口句柄(HWND)增强最终版
-Auto CAPTCHA Recognizer for Thunder (Leidian) Emulator - HWND Final
+雷电模拟器验证码自动识别桌面软件 - 雷电路径增强最终版
+Auto CAPTCHA Recognizer for Thunder (Leidian) Emulator - LDPlayer Path Final
 
 核心改进：
-1. 每个窗口显示唯一 HWND 句柄 ID，不再仅依赖窗口标题
-2. 使用 Windows API GetWindowRect 根据句柄获取精确窗口位置
-3. 输入框位置按 HWND 记录，窗口顺序变化也不会搞错
-4. 填充前可自动激活目标窗口（SetForegroundWindow）
-5. 多种预处理管道 + 多字体模板 + 多尺度匹配（无需 Tesseract）
+1. 雷电安装路径设置（手动填写 + 自动扫描常见路径）
+2. 每个窗口显示唯一 HWND 句柄 ID
+3. 使用 Windows API GetWindowRect 根据句柄获取精确窗口位置
+4. 输入框位置按 HWND 记录，窗口顺序变化也不会搞错
+5. 填充前可自动激活目标窗口（SetForegroundWindow）
+6. 多种预处理管道 + 多字体模板 + 多尺度匹配（无需 Tesseract）
 """
 
 import sys
@@ -51,6 +52,18 @@ ShowWindow = user32.ShowWindow
 ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 ShowWindow.restype = wintypes.BOOL
 
+GetWindowTextLengthW = user32.GetWindowTextLengthW
+GetWindowTextLengthW.argtypes = [wintypes.HWND]
+GetWindowTextLengthW.restype = wintypes.INT
+
+GetWindowTextW = user32.GetWindowTextW
+GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, wintypes.INT]
+GetWindowTextW.restype = wintypes.INT
+
+GetParent = user32.GetParent
+GetParent.argtypes = [wintypes.HWND]
+GetParent.restype = wintypes.HWND
+
 class RECT(ctypes.Structure):
     _fields_ = [("left", wintypes.LONG),
                 ("top", wintypes.LONG),
@@ -91,6 +104,67 @@ def get_rect_by_hwnd(hwnd):
     except Exception:
         pass
     return None
+
+
+def get_window_title_by_hwnd(hwnd):
+    """根据句柄获取窗口标题"""
+    try:
+        length = GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def scan_ldplayer_paths():
+    """
+    扫描常见盘符下的雷电/LDPlayer 安装路径
+    返回找到的路径列表
+    """
+    found = []
+    # 常见雷电安装目录名
+    ld_dir_names = [
+        'leidian', 'LDPlayer', 'ldplayer', '雷电', '雷电模拟器',
+        'Leidian', 'LDPlayer9', 'LDPlayer4', 'LDPlayer3'
+    ]
+    drives = ['C:', 'D:', 'E:', 'F:', 'G:']
+    
+    for drive in drives:
+        if not os.path.exists(drive + '\\'):
+            continue
+        # 常见安装根目录
+        roots = [
+            drive + '\\',
+            drive + '\\Program Files\\',
+            drive + '\\Program Files (x86)\\',
+            drive + '\\雷电\\',
+            drive + '\\Leidian\\',
+        ]
+        for root in roots:
+            if not os.path.exists(root):
+                continue
+            try:
+                for entry in os.listdir(root):
+                    entry_lower = entry.lower()
+                    entry_path = os.path.join(root, entry)
+                    if not os.path.isdir(entry_path):
+                        continue
+                    # 匹配雷电相关目录名
+                    if any(dn.lower() in entry_lower for dn in [d.lower() for d in ld_dir_names]):
+                        # 进一步确认包含 dnplayer.exe 或 ldplayer.exe
+                        exe_found = False
+                        for exe in ['dnplayer.exe', 'ldplayer.exe', 'LDPlayer.exe']:
+                            if os.path.exists(os.path.join(entry_path, exe)):
+                                exe_found = True
+                                break
+                        if exe_found:
+                            found.append(entry_path)
+            except Exception:
+                continue
+    return found
 
 
 class DigitRecognizer:
@@ -335,9 +409,10 @@ class DigitRecognizer:
 
 class ThunderWindowManager:
     """
-    基于窗口句柄(HWND)的窗口管理器
+    基于窗口句柄(HWND)和雷安装路径的窗口管理器
     - 按 HWND 字典存储窗口，每个窗口唯一
     - 使用 Windows API 获取精确窗口位置
+    - 支持按雷电安装路径过滤窗口
     """
 
     def __init__(self):
@@ -347,6 +422,7 @@ class ThunderWindowManager:
             'emulator', 'adb', 'memu', 'nox', 'bluestacks', 'instagram'
         ]
         self.custom_titles = []
+        self.ldplayer_path = ""  # 雷电安装路径，如 D:\雷电\leidian\LDPlayer9
 
     def set_keywords(self, keywords_str):
         self.default_keywords = [k.strip().lower() for k in keywords_str.split(',') if k.strip()]
@@ -358,6 +434,38 @@ class ThunderWindowManager:
     def remove_custom_title(self, title):
         if title in self.custom_titles:
             self.custom_titles.remove(title)
+
+    def set_ldplayer_path(self, path):
+        """设置雷电安装路径"""
+        self.ldplayer_path = path.strip() if path else ""
+
+    def is_in_ldplayer_path(self, hwnd):
+        """检查窗口是否属于指定的雷电安装路径"""
+        if not self.ldplayer_path:
+            return True  # 未设置路径时，不做路径过滤
+        try:
+            # 获取窗口所属进程 ID
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            # 尝试打开进程获取路径
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            hproc = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value
+            )
+            if hproc:
+                buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+                size = ctypes.wintypes.DWORD(ctypes.wintypes.MAX_PATH)
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(hproc, 0, buf, ctypes.byref(size)):
+                    exe_path = buf.value
+                    ctypes.windll.kernel32.CloseHandle(hproc)
+                    # 检查进程路径是否在雷电安装目录下
+                    ld_path_lower = self.ldplayer_path.lower().rstrip('\\')
+                    if exe_path.lower().startswith(ld_path_lower):
+                        return True
+                ctypes.windll.kernel32.CloseHandle(hproc)
+        except Exception:
+            pass
+        return False
 
     def refresh_windows(self):
         """刷新窗口列表，按 HWND 存储"""
@@ -379,6 +487,10 @@ class ThunderWindowManager:
                 if matched and title not in seen_titles:
                     hwnd = w._hWnd if hasattr(w, '_hWnd') else None
                     if hwnd is None:
+                        continue
+
+                    # 如果设置了雷电路径，检查窗口是否属于该路径
+                    if self.ldplayer_path and not self.is_in_ldplayer_path(hwnd):
                         continue
 
                     # 使用 Windows API 获取精确位置
@@ -452,11 +564,12 @@ class CaptchaRecognizerApp:
     - 按 HWND 管理窗口，更准确
     - 输入框位置按 HWND 记录
     - 填充前可激活目标窗口
+    - 支持雷电安装路径设置
     """
 
     def __init__(self, root):
         self.root = root
-        self.root.title("雷电模拟器验证码自动识别 - HWND 句柄增强版")
+        self.root.title("雷电模拟器验证码自动识别 - 雷电路径增强版")
         self.root.geometry("1500x950")
         self.root.resizable(True, True)
 
@@ -492,6 +605,7 @@ class CaptchaRecognizerApp:
                     'keywords', self.window_mgr.default_keywords
                 )
                 self.window_mgr.custom_titles = cfg.get('custom_titles', [])
+                self.window_mgr.ldplayer_path = cfg.get('ldplayer_path', "")
                 raw_pos = cfg.get('input_positions', {})
                 # 键是字符串，转为 int
                 self.input_positions = {int(k): v for k, v in raw_pos.items()}
@@ -503,6 +617,7 @@ class CaptchaRecognizerApp:
             cfg = {
                 'keywords': self.window_mgr.default_keywords,
                 'custom_titles': self.window_mgr.custom_titles,
+                'ldplayer_path': self.window_mgr.ldplayer_path,
                 'input_positions': {str(k): v for k, v in self.input_positions.items()},
             }
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -516,14 +631,27 @@ class CaptchaRecognizerApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(3, weight=1)
+        main.rowconfigure(4, weight=1)
 
-        ttk.Label(main, text="雷电模拟器验证码自动识别 - HWND 句柄增强版",
+        ttk.Label(main, text="雷电模拟器验证码自动识别 - 雷电路径增强版",
                  font=('Microsoft YaHei', 15, 'bold')).grid(row=0, column=0, pady=(5, 8))
 
-        # === 第一行：关键词和刷新 ===
+        # === 第一行：雷电路径设置 ===
+        row_ld = ttk.LabelFrame(main, text="雷电安装路径设置", padding="6")
+        row_ld.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
+        row_ld.columnconfigure(1, weight=1)
+
+        ttk.Label(row_ld, text="雷电路径:").grid(row=0, column=0, sticky=tk.W)
+        self.ldpath_var = tk.StringVar(value=self.window_mgr.ldplayer_path)
+        self.ldpath_entry = ttk.Entry(row_ld, textvariable=self.ldpath_var, width=60)
+        self.ldpath_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(5, 5))
+        ttk.Button(row_ld, text="浏览", command=self.browse_ldpath).grid(row=0, column=2, padx=3)
+        ttk.Button(row_ld, text="自动扫描", command=self.auto_scan_ldpath).grid(row=0, column=3, padx=3)
+        ttk.Button(row_ld, text="应用路径", command=self.apply_ldpath).grid(row=0, column=4, padx=3)
+
+        # === 第二行：关键词和刷新 ===
         row1 = ttk.Frame(main)
-        row1.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
+        row1.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
         row1.columnconfigure(1, weight=1)
 
         ttk.Label(row1, text="窗口关键词:").grid(row=0, column=0, sticky=tk.W)
@@ -535,9 +663,9 @@ class CaptchaRecognizerApp:
         ttk.Button(row1, text="刷新窗口", command=self.refresh_windows).grid(
             row=0, column=3, padx=3)
 
-        # === 第二行：批量操作 ===
+        # === 第三行：批量操作 ===
         row2 = ttk.Frame(main)
-        row2.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
+        row2.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
         for i in range(9):
             row2.columnconfigure(i, weight=1)
 
@@ -551,12 +679,12 @@ class CaptchaRecognizerApp:
         ttk.Button(row2, text="保存配置", command=self.save_config_manual).grid(row=0, column=7, padx=2, sticky=(tk.W, tk.E))
         ttk.Button(row2, text="清空结果", command=self.clear_results).grid(row=0, column=8, padx=2, sticky=(tk.W, tk.E))
 
-        # === 第三行：窗口列表（带 HWND）===
+        # === 第四行：窗口列表（带 HWND）===
         list_frame = ttk.LabelFrame(main, text="模拟器窗口列表（HWND 唯一标识，双击选中/取消）", padding="8")
-        list_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 6))
+        list_frame.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 6))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        main.rowconfigure(3, weight=1)
+        main.rowconfigure(4, weight=1)
 
         columns = ('select', 'hwnd', 'title', 'pos', 'size', 'result', 'status', 'input_pos')
         self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=14)
@@ -586,9 +714,9 @@ class CaptchaRecognizerApp:
 
         self.tree.bind('<Double-1>', self.on_tree_double_click)
 
-        # === 第四行：自动模式 ===
+        # === 第五行：自动模式 ===
         auto_frame = ttk.LabelFrame(main, text="自动模式", padding="8")
-        auto_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
+        auto_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
         auto_frame.columnconfigure(7, weight=1)
 
         self.auto_chk = ttk.Checkbutton(auto_frame, text="启动自动识别/填充",
@@ -607,20 +735,20 @@ class CaptchaRecognizerApp:
         ttk.Button(auto_frame, text="测试单张图片", command=self.test_single_image).grid(
             row=0, column=4, padx=8)
 
-        # === 第五行：日志 ===
+        # === 第六行：日志 ===
         log_frame = ttk.LabelFrame(main, text="运行日志", padding="8")
-        log_frame.grid(row=5, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 6))
+        log_frame.grid(row=6, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 6))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        main.rowconfigure(5, weight=1)
+        main.rowconfigure(6, weight=1)
 
         self.log_text = scrolledtext.ScrolledText(log_frame, height=10, width=170,
                                                  font=('Consolas', 10))
         self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # === 第六行：手动输入 ===
+        # === 第七行：手动输入 ===
         manual_frame = ttk.LabelFrame(main, text="手动输入验证码", padding="8")
-        manual_frame.grid(row=6, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
+        manual_frame.grid(row=7, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
         manual_frame.columnconfigure(1, weight=1)
 
         ttk.Label(manual_frame, text="验证码:").grid(row=0, column=0, sticky=tk.W)
@@ -635,6 +763,31 @@ class CaptchaRecognizerApp:
         self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
+
+    # ---------------- 雷电路径设置 ----------------
+    def browse_ldpath(self):
+        d = filedialog.askdirectory(title="选择雷电安装目录（如 D:\\雷电\\leidian\\LDPlayer9）")
+        if d:
+            self.ldpath_var.set(d)
+
+    def auto_scan_ldpath(self):
+        """自动扫描常见雷电安装路径"""
+        found = scan_ldplayer_paths()
+        if found:
+            # 取第一个找到的路径
+            self.ldpath_var.set(found[0])
+            self.log(f"自动扫描到雷电路径: {found[0]}")
+            if len(found) > 1:
+                self.log(f"还找到其他 {len(found)-1} 个路径，已取第一个")
+        else:
+            messagebox.showinfo("提示", "未自动扫描到雷电安装路径，请手动在上方填写")
+
+    def apply_ldpath(self):
+        path = self.ldpath_var.get().strip()
+        self.window_mgr.set_ldplayer_path(path)
+        self.log(f"雷电路径已设置: {path if path else '(未设置，将识别所有匹配窗口)'}")
+        self.refresh_windows()
+        self.save_config()
 
     # ---------------- 窗口管理 ----------------
     def apply_keywords(self):
@@ -686,8 +839,8 @@ class CaptchaRecognizerApp:
                 "未检测到任何模拟器窗口。\n"
                 "请确认：\n"
                 "1. 模拟器已启动且窗口可见（未最小化）\n"
-                "2. 在上方关键词框中添加窗口标题包含的词（如：雷电, LDPlayer, instagram）\n"
-                "3. 可点击“定位输入框”手动记录位置")
+                "2. 如设置了雷电路径，确保窗口属于该路径下的进程\n"
+                "3. 在上方关键词框中添加窗口标题包含的词（如：雷电, LDPlayer, instagram）")
 
     def select_all(self):
         for v in self.window_vars.values():
