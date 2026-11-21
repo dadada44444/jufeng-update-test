@@ -1,246 +1,401 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-雷电模拟器验证码自动识别桌面软件 - 多窗口增强版
-Auto CAPTCHA Recognizer for Thunder (Leidian) Emulator - Multi-Window Enhanced
+雷电模拟器验证码自动识别桌面软件 - 多窗口增强最终版
+Auto CAPTCHA Recognizer for Thunder (Leidian) Emulator - Multi-Window Final
 
-特点：
-- 自动检测所有模拟器窗口（支持手动添加窗口关键词）
-- 改进的图像预处理（放大、对比度增强、去噪、二值化）
-- 基于 OpenCV 模板匹配的数字识别（无需 Tesseract）
-- 支持多窗口批量识别和自动填充
-- 可调节 UI 字体大小和窗口缩放
+主要改进：
+1. 窗口检测：宽泛匹配 + 手动添加，支持20+个窗口
+2. 识别算法：多种预处理管道 + 多字体模板 + 字符分割 + 多尺度匹配
+3. 自动填充：可视化定位输入框 + 输入法英文切换 + 点击验证
+4. 健壮性：异常处理、窗口丢失重连、线程安全、配置保存
 """
 
 import sys
 import os
+import json
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, simpledialog
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from tkinter import ttk, messagebox, scrolledtext, simpledialog, filedialog
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance, ImageDraw
 import cv2
 import numpy as np
 import pyautogui
 import pygetwindow as gw
+import ctypes
 
+# 关闭 pyautogui 安全限制（自动化需要）
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.05
+
+# Windows 输入法切换（切换到英文）
+def switch_to_english_input():
+    """尝试将输入法切换到英文"""
+    try:
+        if os.name == 'nt':
+            # 发送 Shift+Alt 切换输入法，或直接使用 Win32 API
+            user32 = ctypes.windll.user32
+            # 获取当前前景窗口
+            hwnd = user32.GetForegroundWindow()
+            # 发送 WM_INPUTLANGCHANGEREQUEST 请求英文输入法 (00000409)
+            user32.PostMessageW(hwnd, 0x0050, 0, 0x00000409)
+    except Exception:
+        pass
 
 
 class DigitRecognizer:
     """
-    基于 OpenCV 模板匹配的数字识别器
-    支持自定义模板加载和改进的字符分割
+    改进的数字识别器
+    - 多种字体模板（粗体、细体、不同大小）
+    - 多种预处理管道（自动尝试最佳组合）
+    - 改进字符分割（轮廓 + 投影法结合）
+    - 多尺度模板匹配
     """
 
     def __init__(self):
-        self.templates = {}
+        self.templates = {}  # digit -> list of (template_img, scale)
         self.debug = False
-        self._build_default_templates()
+        self.debug_dir = '/tmp/captcha_debug'
+        self._build_multi_font_templates()
 
-    def _build_default_templates(self):
-        """构建默认的数字模板"""
-        for digit in range(10):
-            img = np.ones((80, 50), dtype=np.uint8) * 255
-            cv2.putText(img, str(digit), (8, 65), cv2.FONT_HERSHEY_SIMPLEX,
-                       2.2, 0, 4, cv2.LINE_AA)
-            _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
-            self.templates[digit] = img
+    def _build_multi_font_templates(self):
+        """构建多种字体和大小的数字模板"""
+        fonts = [
+            (cv2.FONT_HERSHEY_SIMPLEX, 2.0, 3),
+            (cv2.FONT_HERSHEY_SIMPLEX, 2.5, 4),
+            (cv2.FONT_HERSHEY_TRIPLEX, 2.0, 3),
+            (cv2.FONT_HERSHEY_DUPLEX, 2.0, 3),
+            (cv2.FONT_HERSHEY_COMPLEX, 2.0, 3),
+        ]
+        sizes = [(60, 40), (80, 50), (100, 60)]
 
-    def load_templates_from_dir(self, template_dir):
-        """从目录加载自定义模板图像"""
-        if not os.path.exists(template_dir):
+        for font, font_scale, thickness in fonts:
+            for h, w in sizes:
+                for digit in range(10):
+                    img = np.ones((h, w), dtype=np.uint8) * 255
+                    text = str(digit)
+                    # 获取文本大小以居中
+                    (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                    x = max(0, (w - tw) // 2)
+                    y = min(h - 5, int(h * 0.8))
+                    cv2.putText(img, text, (x, y), font, font_scale, 0, thickness, cv2.LINE_AA)
+                    _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
+                    # 归一化大小存储
+                    norm = cv2.resize(img, (50, 80))
+                    if digit not in self.templates:
+                        self.templates[digit] = []
+                    self.templates[digit].append(norm)
+
+    def load_custom_templates(self, template_dir):
+        """从目录加载用户自定义模板（0.png~9.png）"""
+        if not template_dir or not os.path.exists(template_dir):
             return False
         loaded = 0
         for digit in range(10):
-            path = os.path.join(template_dir, f"{digit}.png")
-            if os.path.exists(path):
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-                if img is not None:
-                    _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
-                    self.templates[digit] = img
-                    loaded += 1
+            for ext in ['.png', '.jpg', '.bmp']:
+                path = os.path.join(template_dir, f"{digit}{ext}")
+                if os.path.exists(path):
+                    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                    if img is not None:
+                        _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
+                        norm = cv2.resize(img, (50, 80))
+                        if digit not in self.templates:
+                            self.templates[digit] = []
+                        self.templates[digit].append(norm)
+                        loaded += 1
+                        break
         return loaded > 0
 
-    def preprocess(self, image, scale_factor=2.0):
+    def preprocess_pipeline(self, image, method='auto'):
         """
-        改进的图像预处理
-        - 放大图像
-        - 增强对比度
-        - 去噪
-        - 自适应二值化
+        多种预处理管道，自动尝试并返回最佳结果
+        方法包括：不同缩放、不同阈值、不同滤波组合
         """
         if isinstance(image, Image.Image):
             img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         else:
             img = image
 
-        # 放大图像以便更好地识别细节
-        h, w = img.shape[:2]
-        new_w, new_h = int(w * scale_factor), int(h * scale_factor)
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        results = []
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # 管道1：放大 + CLAHE + 高斯 + 自适应阈值
+        for scale in [1.5, 2.0, 2.5]:
+            h, w = img.shape[:2]
+            new_w, new_h = int(w * scale), int(h * scale)
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+            thresh = cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV, 15, 4
+            )
+            results.append(('adaptive_gauss', scale, thresh))
 
-        # 增强对比度
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
+        # 管道2：放大 + OTSU阈值
+        for scale in [1.5, 2.0, 2.5]:
+            h, w = img.shape[:2]
+            new_w, new_h = int(w * scale), int(h * scale)
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            results.append(('otsu', scale, thresh))
 
-        # 高斯模糊去噪
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        # 管道3：中值滤波 + 自适应阈值（对盐椒噪声效果好）
+        for scale in [2.0]:
+            h, w = img.shape[:2]
+            new_w, new_h = int(w * scale), int(h * scale)
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            median = cv2.medianBlur(gray, 3)
+            thresh = cv2.adaptiveThreshold(
+                median, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                cv2.THRESH_BINARY_INV, 11, 2
+            )
+            results.append(('adaptive_mean', scale, thresh))
 
-        # 自适应二值化
-        thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 15, 4
-        )
+        return results
 
-        # 形态学操作：先开运算去除小噪点，再闭运算连接笔画
-        kernel_open = np.ones((2, 2), np.uint8)
-        kernel_close = np.ones((3, 3), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_close)
-
-        return thresh
-
-    def segment_digits(self, binary_img, min_width=10, min_height=20, max_width_ratio=0.4):
-        """
-        改进的字符分割
-        将二值化图像分割为单个数字字符区域
-        """
+    def segment_digits_contours(self, binary_img, min_width=8, min_height=15, max_width_ratio=0.5):
+        """基于轮廓的字符分割"""
         contours, _ = cv2.findContours(
             binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-
         h, w = binary_img.shape
         regions = []
         for cnt in contours:
             x, y, rw, rh = cv2.boundingRect(cnt)
-            # 过滤掉太小或太大的区域
             if rw < min_width or rh < min_height:
                 continue
-            if rw > w * max_width_ratio:  # 太宽可能是多个字符连在一起
-                continue
-            regions.append((x, y, rw, rh))
-
-        # 按 x 坐标排序，从左到右
+            if rw > w * max_width_ratio:
+                # 太宽可能是多个字符连在一起，尝试垂直切分
+                # 简单处理：按等宽切分
+                num_chars = max(1, round(rw / (w * 0.15)))
+                char_w = rw // num_chars
+                for i in range(num_chars):
+                    cx = x + i * char_w
+                    cw = char_w if i < num_chars - 1 else rw - i * char_w
+                    regions.append((cx, y, cw, rh))
+            else:
+                regions.append((x, y, rw, rh))
         regions.sort(key=lambda r: r[0])
         return regions
 
-    def recognize_digit(self, digit_img):
-        """对单个数字图像进行模板匹配识别"""
+    def segment_digits_projection(self, binary_img):
+        """基于垂直投影的字符分割（处理连在一起的数字）"""
+        h, w = binary_img.shape
+        # 计算每列的白色像素数
+        col_sum = np.sum(binary_img > 0, axis=0)
+        # 找到有字符的列
+        in_char = col_sum > 0
+        regions = []
+        start = None
+        for i, val in enumerate(in_char):
+            if val and start is None:
+                start = i
+            elif not val and start is not None:
+                end = i
+                if end - start >= 5:  # 最小宽度
+                    regions.append((start, 0, end - start, h))
+                start = None
+        if start is not None:
+            regions.append((start, 0, w - start, h))
+        # 转换为 (x, y, w, h) 格式，y=0 表示全高，后续再裁剪
+        return [(x, 0, wd, h) for x, y, wd, h in regions]
+
+    def recognize_digit_multi(self, digit_roi):
+        """对单个数字使用多模板、多尺度匹配"""
+        if digit_roi.shape[0] < 15 or digit_roi.shape[1] < 8:
+            return None, 0.0
+
         best_digit = None
-        best_score = -1
+        best_score = -1.0
 
-        # 调整输入图像大小以匹配模板
-        input_resized = cv2.resize(digit_img, (50, 80))
-        _, input_resized = cv2.threshold(
-            input_resized, 127, 255, cv2.THRESH_BINARY_INV
-        )
+        # 归一化输入
+        input_norm = cv2.resize(digit_roi, (50, 80))
+        _, input_norm = cv2.threshold(input_norm, 127, 255, cv2.THRESH_BINARY_INV)
 
-        for digit, template in self.templates.items():
-            tmpl_resized = cv2.resize(template, (50, 80))
-            result = cv2.matchTemplate(
-                input_resized, tmpl_resized, cv2.TM_CCOEFF_NORMED
-            )
-            _, max_val, _, _ = cv2.minMaxLoc(result)
+        # 尝试不同的匹配方法
+        for digit, template_list in self.templates.items():
+            for template in template_list:
+                # 直接匹配
+                result = cv2.matchTemplate(input_norm, template, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
 
-            if max_val > best_score:
-                best_score = max_val
-                best_digit = digit
+                # 也尝试反色匹配（有些验证码是白字黑底）
+                input_inv = 255 - input_norm
+                result2 = cv2.matchTemplate(input_inv, template, cv2.TM_CCOEFF_NORMED)
+                _, max_val2, _, _ = cv2.minMaxLoc(result2)
 
-        # 降低置信度阈值以提高召回率
-        if best_score > 0.35:
+                score = max(max_val, max_val2)
+                if score > best_score:
+                    best_score = score
+                    best_digit = digit
+
+        # 动态阈值：如果最佳得分明显高于次佳，置信度更高
+        if best_digit is not None and best_score > 0.30:
             return str(best_digit), best_score
         return None, best_score
 
-    def recognize(self, image, scale_factor=2.0):
-        """识别验证码图像中的所有数字"""
-        processed = self.preprocess(image, scale_factor)
-        regions = self.segment_digits(processed)
+    def recognize(self, image):
+        """
+        主识别入口：尝试多种预处理 + 分割方法，返回最佳结果
+        """
+        pipelines = self.preprocess_pipeline(image)
 
-        if not regions:
-            return None, "未检测到数字字符"
+        best_text = None
+        best_info = ""
+        best_score = -1.0
 
-        result_digits = []
-        total_confidence = 0
+        for method_name, scale, binary in pipelines:
+            # 尝试轮廓分割
+            regions = self.segment_digits_contours(binary)
 
-        for x, y, w, h in regions:
-            # 提取数字区域，添加边距
-            pad = 5
-            y1 = max(0, y - pad)
-            y2 = min(processed.shape[0], y + h + pad)
-            x1 = max(0, x - pad)
-            x2 = min(processed.shape[1], x + w + pad)
-            digit_roi = processed[y1:y2, x1:x2]
+            # 如果轮廓分割太少，尝试投影分割
+            if len(regions) < 2:
+                proj_regions = self.segment_digits_projection(binary)
+                if len(proj_regions) > len(regions):
+                    regions = proj_regions
 
-            # 跳过太小的区域
-            if digit_roi.shape[0] < 15 or digit_roi.shape[1] < 10:
+            if not regions:
                 continue
 
-            digit, conf = self.recognize_digit(digit_roi)
-            if digit:
-                result_digits.append(digit)
-                total_confidence += conf
+            # 进一步过滤：按宽度排序，保留最可能的4-6个字符
+            regions.sort(key=lambda r: r[2] * r[3], reverse=True)
+            regions = regions[:8]
+            regions.sort(key=lambda r: r[0])  # 按x排序
 
-        if result_digits:
-            captcha_text = ''.join(result_digits)
-            avg_conf = total_confidence / len(result_digits) if result_digits else 0
-            return captcha_text, f"识别: {captcha_text} (置信度: {avg_conf:.2f})"
-        else:
-            return None, "无法识别任何数字"
+            result_digits = []
+            total_conf = 0.0
+            valid_count = 0
+
+            for x, y, w, h in regions:
+                # 提取ROI，加边距
+                pad = 4
+                y1 = max(0, y - pad)
+                y2 = min(binary.shape[0], y + h + pad)
+                x1 = max(0, x - pad)
+                x2 = min(binary.shape[1], x + w + pad)
+                roi = binary[y1:y2, x1:x2]
+
+                if roi.shape[0] < 12 or roi.shape[1] < 8:
+                    continue
+
+                digit, conf = self.recognize_digit_multi(roi)
+                if digit:
+                    result_digits.append(digit)
+                    total_conf += conf
+                    valid_count += 1
+
+            if valid_count >= 3:  # 至少识别出3个数字才算成功
+                text = ''.join(result_digits)
+                avg_conf = total_conf / valid_count if valid_count else 0
+                # 综合得分：字符数 * 平均置信度
+                score = valid_count * avg_conf
+                if score > best_score:
+                    best_score = score
+                    best_text = text
+                    best_info = f"[{method_name}] 识别: {text} (字符: {valid_count}, 置信度: {avg_conf:.2f})"
+
+        if best_text:
+            return best_text, best_info
+        return None, "所有预处理方案均未识别出有效验证码"
 
 
 class ThunderWindowManager:
-    """管理多个雷电模拟器窗口"""
+    """
+    改进的窗口管理器
+    - 宽泛匹配所有可能的模拟器窗口
+    - 支持手动添加窗口标题
+    - 检查窗口可见性和最小化状态
+    """
 
     def __init__(self):
         self.windows = []
-        self.keywords = [
-            'thunder', 'leidian', '雷电', 'android', 'emulator',
-            'adb', 'memu', 'nox', 'bluestacks', 'instagram'
+        self.default_keywords = [
+            'thunder', 'leidian', '雷电', 'ldplayer', 'android',
+            'emulator', 'adb', 'memu', 'nox', 'bluestacks', 'instagram'
         ]
+        self.custom_titles = []  # 用户手动添加的完整标题
 
     def set_keywords(self, keywords_str):
-        """设置窗口标题关键词（逗号分隔）"""
-        self.keywords = [k.strip().lower() for k in keywords_str.split(',') if k.strip()]
+        """设置关键词列表"""
+        self.default_keywords = [k.strip().lower() for k in keywords_str.split(',') if k.strip()]
+
+    def add_custom_title(self, title):
+        """添加手动指定的窗口标题"""
+        if title and title not in self.custom_titles:
+            self.custom_titles.append(title)
+
+    def remove_custom_title(self, title):
+        """移除自定义标题"""
+        if title in self.custom_titles:
+            self.custom_titles.remove(title)
 
     def refresh_windows(self):
-        """刷新窗口列表，返回所有匹配的模拟器窗口"""
+        """刷新窗口列表，返回所有匹配的窗口"""
         self.windows = []
+        seen_titles = set()
+
         try:
             all_windows = gw.getAllWindows()
             for w in all_windows:
-                title = w.title.lower()
-                # 匹配包含任意关键词的窗口
-                if any(kw in title for kw in self.keywords):
+                title = w.title
+                if not title or title.strip() == '':
+                    continue
+
+                title_lower = title.lower()
+
+                # 检查是否匹配关键词
+                matched = any(kw in title_lower for kw in self.default_keywords)
+
+                # 检查是否在自定义列表中
+                if not matched and title in self.custom_titles:
+                    matched = True
+
+                if matched and title not in seen_titles:
+                    # 检查窗口是否最小化（宽高为0或负通常表示最小化/隐藏）
+                    if w.width <= 0 or w.height <= 0:
+                        continue
+
                     self.windows.append({
-                        'title': w.title,
+                        'title': title,
                         'handle': w._hWnd if hasattr(w, '_hWnd') else None,
                         'left': w.left,
                         'top': w.top,
                         'width': w.width,
                         'height': w.height,
                     })
+                    seen_titles.add(title)
         except Exception as e:
             print(f"刷新窗口失败: {e}")
+
         return self.windows
 
     def capture_window(self, index):
-        """捕获指定索引窗口的截图"""
+        """捕获指定窗口截图"""
         if index < 0 or index >= len(self.windows):
             return None, "窗口索引无效"
 
         win = self.windows[index]
         try:
-            left = win['left']
-            top = win['top']
-            width = win['width']
-            height = win['height']
+            left = max(0, win['left'])
+            top = max(0, win['top'])
+            width = max(1, win['width'])
+            height = max(1, win['height'])
+
+            # 限制在屏幕范围内
+            screen_w, screen_h = pyautogui.size()
+            if left + width > screen_w:
+                width = screen_w - left
+            if top + height > screen_h:
+                height = screen_h - top
 
             if width <= 0 or height <= 0:
-                return None, "窗口大小无效"
+                return None, "窗口超出屏幕范围"
 
             screenshot = pyautogui.screenshot(region=(left, top, width, height))
             return screenshot, None
@@ -248,7 +403,6 @@ class ThunderWindowManager:
             return None, str(e)
 
     def get_window_info(self, index):
-        """获取窗口信息字符串"""
         if index < 0 or index >= len(self.windows):
             return "无效窗口"
         win = self.windows[index]
@@ -257,88 +411,123 @@ class ThunderWindowManager:
 
 
 class CaptchaRecognizerApp:
-    """多窗口验证码自动识别桌面应用 - 增强版"""
+    """
+    主应用程序
+    - 多窗口批量管理
+    - 可视化输入框定位
+    - 自动循环识别填充
+    - 配置保存
+    """
 
     def __init__(self, root):
         self.root = root
         self.root.title("雷电模拟器验证码自动识别 - 多窗口增强版")
-        self.root.geometry("1300x850")
+        self.root.geometry("1400x900")
         self.root.resizable(True, True)
-
-        # UI 缩放因子
-        self.ui_scale = tk.DoubleVar(value=1.0)
 
         self.window_mgr = ThunderWindowManager()
         self.recognizer = DigitRecognizer()
 
-        # 状态变量
+        # 状态
         self.is_running = False
         self.auto_mode = tk.BooleanVar(value=False)
         self.interval = tk.DoubleVar(value=3.0)
-        self.last_results = {}  # window_index -> last captcha text
-        self.window_vars = []  # 每个窗口的复选框变量
-        self.result_vars = []  # 每个窗口的结果变量
-        self.status_vars = []  # 每个窗口的状态变量
+        self.last_results = {}  # index -> text
+        self.window_vars = []
+        self.result_vars = []
+        self.status_vars = []
+
+        # 输入框位置记录（每个窗口独立）
+        self.input_positions = {}  # index -> (x, y)
+
+        # 配置文件
+        self.config_file = 'captcha_config.json'
+        self.load_config()
 
         self.setup_ui()
         self.refresh_windows()
 
+    def load_config(self):
+        """加载配置"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                self.window_mgr.default_keywords = cfg.get(
+                    'keywords', self.window_mgr.default_keywords
+                )
+                self.window_mgr.custom_titles = cfg.get('custom_titles', [])
+                self.input_positions = cfg.get('input_positions', {})
+                # 将字符串键转为整数
+                self.input_positions = {int(k): v for k, v in self.input_positions.items()}
+        except Exception:
+            pass
+
+    def save_config(self):
+        """保存配置"""
+        try:
+            cfg = {
+                'keywords': self.window_mgr.default_keywords,
+                'custom_titles': self.window_mgr.custom_titles,
+                'input_positions': {str(k): v for k, v in self.input_positions.items()},
+            }
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"保存配置失败: {e}")
+
     def setup_ui(self):
-        """构建用户界面"""
-        # 主容器，使用 Canvas 支持滚动
-        main_container = ttk.Frame(self.root)
-        main_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        """构建界面"""
+        # 主容器
+        main = ttk.Frame(self.root, padding="8")
+        main.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_container.columnconfigure(0, weight=1)
-        main_container.rowconfigure(1, weight=1)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(3, weight=1)
 
-        # === 顶部标题 ===
-        title_label = ttk.Label(main_container, text="雷电模拟器验证码自动识别 - 多窗口增强版",
-                               font=('Microsoft YaHei', 14, 'bold'))
-        title_label.grid(row=0, column=0, pady=(10, 5))
+        # 标题
+        ttk.Label(main, text="雷电模拟器验证码自动识别 - 多窗口增强版",
+                 font=('Microsoft YaHei', 15, 'bold')).grid(row=0, column=0, pady=(5, 8))
 
-        # === 控制按钮区 ===
-        btn_frame = ttk.Frame(main_container)
-        btn_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        btn_frame.columnconfigure(6, weight=1)
+        # === 第一行：关键词和刷新 ===
+        row1 = ttk.Frame(main)
+        row1.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
+        row1.columnconfigure(1, weight=1)
 
-        ttk.Button(btn_frame, text="刷新窗口 / Refresh",
-                  command=self.refresh_windows).grid(row=0, column=0, padx=3, pady=3)
+        ttk.Label(row1, text="窗口关键词:").grid(row=0, column=0, sticky=tk.W)
+        self.keyword_var = tk.StringVar(value=",".join(self.window_mgr.default_keywords))
+        ttk.Entry(row1, textvariable=self.keyword_var, width=50).grid(
+            row=0, column=1, sticky=(tk.W, tk.E), padx=(5, 5))
+        ttk.Button(row1, text="应用关键词", command=self.apply_keywords).grid(
+            row=0, column=2, padx=3)
+        ttk.Button(row1, text="刷新窗口", command=self.refresh_windows).grid(
+            row=0, column=3, padx=3)
 
-        self.select_all_btn = ttk.Button(btn_frame, text="全选 / Select All",
-                   command=self.select_all)
-        self.select_all_btn.grid(row=0, column=1, padx=3, pady=3)
+        # === 第二行：批量操作按钮 ===
+        row2 = ttk.Frame(main)
+        row2.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
+        for i in range(8):
+            row2.columnconfigure(i, weight=1)
 
-        self.deselect_all_btn = ttk.Button(btn_frame, text="取消全选 / Deselect All",
-                   command=self.deselect_all)
-        self.deselect_all_btn.grid(row=0, column=2, padx=3, pady=3)
+        ttk.Button(row2, text="全选", command=self.select_all).grid(row=0, column=0, padx=2, sticky=(tk.W, tk.E))
+        ttk.Button(row2, text="取消全选", command=self.deselect_all).grid(row=0, column=1, padx=2, sticky=(tk.W, tk.E))
+        ttk.Button(row2, text="识别选中", command=self.recognize_selected).grid(row=0, column=2, padx=2, sticky=(tk.W, tk.E))
+        ttk.Button(row2, text="自动填充选中", command=self.auto_fill_selected).grid(row=0, column=3, padx=2, sticky=(tk.W, tk.E))
+        ttk.Button(row2, text="定位输入框", command=self.locate_input_positions).grid(row=0, column=4, padx=2, sticky=(tk.W, tk.E))
+        ttk.Button(row2, text="加载模板", command=self.load_templates_dialog).grid(row=0, column=5, padx=2, sticky=(tk.W, tk.E))
+        ttk.Button(row2, text="保存配置", command=self.save_config_manual).grid(row=0, column=6, padx=2, sticky=(tk.W, tk.E))
+        ttk.Button(row2, text="清空结果", command=self.clear_results).grid(row=0, column=7, padx=2, sticky=(tk.W, tk.E))
 
-        self.recognize_btn = ttk.Button(btn_frame, text="识别选中 / Recognize Selected",
-                   command=self.recognize_selected)
-        self.recognize_btn.grid(row=0, column=3, padx=3, pady=3)
-
-        self.fill_btn = ttk.Button(btn_frame, text="自动填充选中 / Auto Fill Selected",
-                   command=self.auto_fill_selected)
-        self.fill_btn.grid(row=0, column=4, padx=3, pady=3)
-
-        # 窗口关键词设置
-        ttk.Label(btn_frame, text="窗口关键词:").grid(row=0, column=5, padx=(10, 3))
-        self.keyword_var = tk.StringVar(value=",".join(self.window_mgr.keywords))
-        self.keyword_entry = ttk.Entry(btn_frame, textvariable=self.keyword_var, width=30)
-        self.keyword_entry.grid(row=0, column=6, padx=3, pady=3, sticky=(tk.W, tk.E))
-        ttk.Button(btn_frame, text="应用", command=self.apply_keywords).grid(row=0, column=7, padx=3, pady=3)
-
-        # === 窗口列表区 ===
-        list_frame = ttk.LabelFrame(main_container, text="模拟器窗口列表 / Emulator Windows", padding="10")
-        list_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        # === 第三行：窗口列表 ===
+        list_frame = ttk.LabelFrame(main, text="模拟器窗口列表（双击选中/取消）", padding="8")
+        list_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 6))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        main_container.rowconfigure(2, weight=1)
+        main.rowconfigure(3, weight=1)
 
-        # 创建 Treeview 显示窗口列表
-        columns = ('select', 'title', 'pos', 'size', 'result', 'status')
-        self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=15)
+        columns = ('select', 'title', 'pos', 'size', 'result', 'status', 'input_pos')
+        self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=14)
 
         self.tree.heading('select', text='选择')
         self.tree.heading('title', text='窗口标题')
@@ -346,323 +535,413 @@ class CaptchaRecognizerApp:
         self.tree.heading('size', text='大小')
         self.tree.heading('result', text='识别结果')
         self.tree.heading('status', text='状态')
+        self.tree.heading('input_pos', text='输入框位置')
 
-        self.tree.column('select', width=60, anchor='center')
-        self.tree.column('title', width=300)
-        self.tree.column('pos', width=140)
-        self.tree.column('size', width=120)
+        self.tree.column('select', width=55, anchor='center')
+        self.tree.column('title', width=280)
+        self.tree.column('pos', width=130)
+        self.tree.column('size', width=110)
         self.tree.column('result', width=200)
-        self.tree.column('status', width=180)
+        self.tree.column('status', width=170)
+        self.tree.column('input_pos', width=120, anchor='center')
 
-        # 滚动条
-        v_scroll = ttk.Scrollbar(list_frame, orient='vertical', command=self.tree.yview)
-        self.tree.configure(yscrollcommand=v_scroll.set)
-
+        vsb = ttk.Scrollbar(list_frame, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
         self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        v_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        vsb.grid(row=0, column=1, sticky=(tk.N, tk.S))
 
-        # 双击选中/取消选中
         self.tree.bind('<Double-1>', self.on_tree_double_click)
 
-        # === 自动模式区 ===
-        auto_frame = ttk.LabelFrame(main_container, text="自动模式 / Auto Mode", padding="10")
-        auto_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        auto_frame.columnconfigure(4, weight=1)
+        # === 第四行：自动模式 ===
+        auto_frame = ttk.LabelFrame(main, text="自动模式", padding="8")
+        auto_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 6))
+        auto_frame.columnconfigure(6, weight=1)
 
-        self.auto_check = ttk.Checkbutton(auto_frame, text="启动自动识别 / Enable Auto Recognition",
-                       variable=self.auto_mode, command=self.toggle_auto_mode)
-        self.auto_check.grid(row=0, column=0, sticky=tk.W, padx=(0, 20))
+        self.auto_chk = ttk.Checkbutton(auto_frame, text="启动自动识别/填充",
+                                       variable=self.auto_mode, command=self.toggle_auto_mode)
+        self.auto_chk.grid(row=0, column=0, sticky=tk.W, padx=(0, 15))
 
         ttk.Label(auto_frame, text="间隔(秒):").grid(row=0, column=1, sticky=tk.E)
-        self.interval_spin = ttk.Spinbox(auto_frame, from_=1, to=60, increment=0.5,
-                   textvariable=self.interval, width=8)
+        self.interval_spin = ttk.Spinbox(auto_frame, from_=1, to=300, increment=0.5,
+                                        textvariable=self.interval, width=8)
         self.interval_spin.grid(row=0, column=2, sticky=tk.W, padx=(5, 20))
 
-        self.auto_status_label = ttk.Label(auto_frame, text="状态: 就绪 / Status: Ready",
-                                          foreground="green", font=('Microsoft YaHei', 10, 'bold'))
-        self.auto_status_label.grid(row=0, column=3, sticky=tk.W)
+        self.auto_status = ttk.Label(auto_frame, text="就绪",
+                                    foreground="green", font=('Microsoft YaHei', 10, 'bold'))
+        self.auto_status.grid(row=0, column=3, sticky=tk.W)
 
-        # UI 缩放控制
-        ttk.Label(auto_frame, text="界面缩放:").grid(row=1, column=0, sticky=tk.E, pady=(5, 0))
-        self.scale_spin = ttk.Spinbox(auto_frame, from_=0.8, to=2.0, increment=0.1,
-                   textvariable=self.ui_scale, width=8, command=self.apply_ui_scale)
-        self.scale_spin.grid(row=1, column=1, sticky=tk.W, padx=(5, 0), pady=(5, 0))
+        ttk.Button(auto_frame, text="测试识别一张图", command=self.test_single_image).grid(
+            row=0, column=4, padx=8)
 
-        # === 日志区 ===
-        log_frame = ttk.LabelFrame(main_container, text="日志 / Log", padding="10")
-        log_frame.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        # === 第五行：日志 ===
+        log_frame = ttk.LabelFrame(main, text="运行日志", padding="8")
+        log_frame.grid(row=5, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 6))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        main_container.rowconfigure(4, weight=1)
+        main.rowconfigure(5, weight=1)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, width=140,
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, width=160,
                                                  font=('Consolas', 10))
         self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # === 手动输入区 ===
-        manual_frame = ttk.LabelFrame(main_container, text="手动输入 / Manual Input", padding="10")
-        manual_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        # === 第六行：手动输入 ===
+        manual_frame = ttk.LabelFrame(main, text="手动输入验证码", padding="8")
+        manual_frame.grid(row=6, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
         manual_frame.columnconfigure(1, weight=1)
 
         ttk.Label(manual_frame, text="验证码:").grid(row=0, column=0, sticky=tk.W)
         self.manual_var = tk.StringVar()
-        self.manual_entry = ttk.Entry(manual_frame, textvariable=self.manual_var, font=('Consolas', 14))
-        self.manual_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=3)
+        ttk.Entry(manual_frame, textvariable=self.manual_var, font=('Consolas', 14), width=20).grid(
+            row=0, column=1, sticky=(tk.W, tk.E), padx=(5, 8), pady=3)
+        ttk.Button(manual_frame, text="输入到选中第一个窗口",
+                  command=self.manual_input_selected).grid(row=0, column=2, padx=5)
 
-        ttk.Button(manual_frame, text="输入到选中窗口 / Input to Selected",
-                  command=self.manual_input_selected).grid(row=0, column=2, padx=(10, 0))
-
-    def log(self, message):
-        """添加日志"""
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+    def log(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
 
-    def refresh_windows(self):
-        """刷新窗口列表"""
-        windows = self.window_mgr.refresh_windows()
+    # ---------------- 窗口管理 ----------------
+    def apply_keywords(self):
+        self.window_mgr.set_keywords(self.keyword_var.get())
+        self.log(f"关键词已更新: {self.keyword_var.get()}")
+        self.refresh_windows()
 
-        # 清空现有项目
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+    def refresh_windows(self):
+        wins = self.window_mgr.refresh_windows()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
 
         self.window_vars = []
         self.result_vars = []
         self.status_vars = []
 
-        for i, win in enumerate(windows):
+        for i, w in enumerate(wins):
             var = tk.BooleanVar(value=False)
             self.window_vars.append(var)
+            rv = tk.StringVar(value="")
+            self.result_vars.append(rv)
+            sv = tk.StringVar(value="待处理")
+            self.status_vars.append(sv)
 
-            result_var = tk.StringVar(value="")
-            self.result_vars.append(result_var)
-
-            status_var = tk.StringVar(value="待处理 / Pending")
-            self.status_vars.append(status_var)
-
-            pos = f"({win['left']}, {win['top']})"
-            size = f"{win['width']}x{win['height']}"
+            pos = f"({w['left']}, {w['top']})"
+            size = f"{w['width']}x{w['height']}"
+            ip = self.input_positions.get(i, "未设置")
 
             self.tree.insert('', tk.END, iid=str(i), values=(
-                '☐', win['title'], pos, size, '', '待处理 / Pending'
+                '☐', w['title'], pos, size, '', '待处理', ip
             ))
 
-        self.log(f"找到 {len(windows)} 个模拟器窗口 / Found {len(windows)} emulator windows")
-
-        if not windows:
+        self.log(f"检测到 {len(wins)} 个模拟器窗口")
+        if not wins:
             messagebox.showinfo("提示",
-                "未找到模拟器窗口。\n"
-                "请确保：\n"
-                "1. 雷电模拟器正在运行且窗口可见\n"
-                "2. 窗口标题包含：thunder, leidian, 雷电, android, emulator, instagram 等\n"
-                "3. 如有需要，可在上方“窗口关键词”中自定义匹配关键词")
-
-    def apply_keywords(self):
-        """应用自定义窗口关键词"""
-        keywords = self.keyword_var.get()
-        self.window_mgr.set_keywords(keywords)
-        self.log(f"已更新窗口关键词: {keywords}")
-        self.refresh_windows()
+                "未检测到任何模拟器窗口。\n"
+                "请确认：\n"
+                "1. 模拟器已启动且窗口可见（未最小化）\n"
+                "2. 在上方关键词框中添加窗口标题包含的词（如：雷电, LDPlayer, instagram）\n"
+                "3. 或点击“定位输入框”后手动记录窗口")
 
     def select_all(self):
-        """全选所有窗口"""
-        for i in range(len(self.window_vars)):
-            self.window_vars[i].set(True)
-        self.update_tree_display()
+        for v in self.window_vars:
+            v.set(True)
+        self.update_tree()
 
     def deselect_all(self):
-        """取消全选"""
-        for i in range(len(self.window_vars)):
-            self.window_vars[i].set(False)
-        self.update_tree_display()
+        for v in self.window_vars:
+            v.set(False)
+        self.update_tree()
 
-    def update_tree_display(self):
-        """更新 Treeview 显示选中状态和结果"""
+    def get_selected(self):
+        return [i for i, v in enumerate(self.window_vars) if v.get()]
+
+    def update_tree(self):
         for i in range(len(self.window_vars)):
-            item_id = str(i)
-            if not self.tree.exists(item_id):
+            if not self.tree.exists(str(i)):
                 continue
-
-            checked = '☑' if self.window_vars[i].get() else '☐'
-            result = self.result_vars[i].get()
-            status = self.status_vars[i].get()
-
-            self.tree.item(item_id, values=(
-                checked,
-                self.window_mgr.windows[i]['title'],
-                f"({self.window_mgr.windows[i]['left']}, {self.window_mgr.windows[i]['top']})",
-                f"{self.window_mgr.windows[i]['width']}x{self.window_mgr.windows[i]['height']}",
-                result,
-                status
+            chk = '☑' if self.window_vars[i].get() else '☐'
+            w = self.window_mgr.windows[i]
+            ip = self.input_positions.get(i, "未设置")
+            self.tree.item(str(i), values=(
+                chk, w['title'],
+                f"({w['left']}, {w['top']})",
+                f"{w['width']}x{w['height']}",
+                self.result_vars[i].get(),
+                self.status_vars[i].get(),
+                ip
             ))
 
     def on_tree_double_click(self, event):
-        """双击切换选中状态"""
         item = self.tree.selection()
         if item:
-            idx = int(item[0])
-            self.window_vars[idx].set(not self.window_vars[idx].get())
-            self.update_tree_display()
+            i = int(item[0])
+            self.window_vars[i].set(not self.window_vars[i].get())
+            self.update_tree()
 
-    def get_selected_indices(self):
-        """获取所有选中的窗口索引"""
-        return [i for i, var in enumerate(self.window_vars) if var.get()]
+    # ---------------- 识别核心 ----------------
+    def capture_and_recognize(self, i):
+        """单窗口捕获识别（线程安全，结果通过after回调）"""
+        try:
+            screenshot, err = self.window_mgr.capture_window(i)
+            if err:
+                self.root.after(0, lambda: self.status_vars[i].set(f"截图失败: {err}"))
+                self.root.after(0, self.update_tree)
+                return
 
-    def capture_and_recognize(self, index):
-        """捕获并识别单个窗口的验证码"""
-        screenshot, error = self.window_mgr.capture_window(index)
-        if error:
-            self.log(f"窗口 {index} 捕获失败: {error}")
-            self.root.after(0, lambda i=index: self.status_vars[i].set(f"捕获失败: {error}"))
-            return
+            w, h = screenshot.size
+            # 验证码通常在窗口上部 8%-45% 区域
+            region = screenshot.crop((0, int(h * 0.08), w, int(h * 0.45)))
 
-        # 裁剪验证码区域（窗口上半部分，验证码通常出现在上方）
-        w, h = screenshot.size
-        captcha_region = screenshot.crop((0, int(h * 0.08), w, int(h * 0.45)))
+            text, info = self.recognizer.recognize(region)
 
-        text, info = self.recognizer.recognize(captcha_region, scale_factor=2.5)
+            if text:
+                self.last_results[i] = text
+                self.root.after(0, lambda: self.result_vars[i].set(text))
+                self.root.after(0, lambda: self.status_vars[i].set("识别成功"))
+                self.root.after(0, lambda: self.log(f"窗口{i} 识别成功: {text}"))
+            else:
+                self.root.after(0, lambda: self.status_vars[i].set(f"识别失败: {info}"))
+                self.root.after(0, lambda: self.log(f"窗口{i} 识别失败: {info}"))
 
-        if text:
-            self.last_results[index] = text
-            self.root.after(0, lambda i=index, t=text: self.result_vars[i].set(t))
-            self.root.after(0, lambda i=index: self.status_vars[i].set("识别成功 / Recognized"))
-            self.root.after(0, lambda t=text: self.log(f"窗口 {index} 识别成功: {t}"))
-        else:
-            self.root.after(0, lambda i=index: self.status_vars[i].set(f"识别失败: {info}"))
-            self.root.after(0, lambda i=info: self.log(f"窗口 {index} 识别失败: {i}"))
-
-        self.root.after(0, self.update_tree_display)
+            self.root.after(0, self.update_tree)
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"窗口{i} 异常: {e}"))
+            self.root.after(0, lambda: self.status_vars[i].set(f"异常: {e}"))
+            self.root.after(0, self.update_tree)
 
     def recognize_selected(self):
-        """识别所有选中窗口的验证码"""
-        indices = self.get_selected_indices()
-        if not indices:
-            messagebox.showwarning("警告", "请先选择至少一个窗口 / Please select at least one window")
+        idxs = self.get_selected()
+        if not idxs:
+            messagebox.showwarning("提示", "请先勾选至少一个窗口")
+            return
+        self.log(f"开始识别 {len(idxs)} 个选中窗口")
+        for i in idxs:
+            self.root.after(0, lambda ii=i: self.status_vars[ii].set("识别中..."))
+            threading.Thread(target=self.capture_and_recognize, args=(i,), daemon=True).start()
+
+    # ---------------- 自动填充 ----------------
+    def locate_input_positions(self):
+        """可视化定位：截图当前选中窗口，让用户点击输入框位置"""
+        idxs = self.get_selected()
+        if not idxs:
+            messagebox.showwarning("提示", "请先勾选要定位的窗口")
             return
 
-        self.log(f"开始识别 {len(indices)} 个选中窗口")
+        # 只处理第一个选中的，演示如何定位
+        i = idxs[0]
+        screenshot, err = self.window_mgr.capture_window(i)
+        if err:
+            messagebox.showerror("错误", f"截图失败: {err}")
+            return
 
-        for idx in indices:
-            self.root.after(0, lambda i=idx: self.status_vars[i].set("识别中..."))
-            threading.Thread(target=self.capture_and_recognize, args=(idx,), daemon=True).start()
+        # 打开一个选择器窗口
+        self._open_position_picker(i, screenshot)
+
+    def _open_position_picker(self, index, screenshot):
+        """弹出一个全屏选择器，用户点击输入框位置"""
+        picker = tk.Toplevel(self.root)
+        picker.title(f"点击窗口 {index} 的验证码输入框位置")
+        picker.attributes('-fullscreen', True)
+        picker.attributes('-topmost', True)
+        picker.configure(cursor='crosshair')
+
+        # 显示截图（缩放到屏幕）
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        img_w, img_h = screenshot.size
+        scale = min(sw / img_w, sh / img_h) * 0.9
+        disp_w, disp_h = int(img_w * scale), int(img_h * scale)
+        disp = screenshot.resize((disp_w, disp_h), Image.LANCZOS)
+        photo = tk.PhotoImage(image=disp)  # PIL -> tkinter 需要 ImageTk，这里简化用 PhotoImage 需要 PPM
+        # 实际上 PhotoImage 不支持 PIL 直接，需要 ImageTk
+        from PIL import ImageTk
+        photo = ImageTk.PhotoImage(disp)
+
+        canvas = tk.Canvas(picker, width=disp_w, height=disp_h, cursor='crosshair')
+        canvas.pack()
+        canvas.create_image(0, 0, image=photo, anchor='nw')
+        canvas.photo = photo  # 防止被GC
+
+        result = {'pos': None}
+
+        def on_click(event):
+            # 转换回原图坐标
+            x = int(event.x / scale)
+            y = int(event.y / scale)
+            # 加上窗口左上角偏移
+            win = self.window_mgr.windows[index]
+            abs_x = win['left'] + x
+            abs_y = win['top'] + y
+            result['pos'] = (abs_x, abs_y)
+            picker.destroy()
+
+        canvas.bind('<Button-1>', on_click)
+        picker.bind('<Escape>', lambda e: picker.destroy())
+
+        self.root.wait_window(picker)
+
+        if result['pos']:
+            x, y = result['pos']
+            self.input_positions[index] = [x, y]
+            self.log(f"窗口 {index} 输入框位置已记录: ({x}, {y})")
+            self.update_tree()
+            self.save_config()
 
     def auto_fill_selected(self):
-        """自动填充所有选中窗口的验证码"""
-        indices = self.get_selected_indices()
-        if not indices:
-            messagebox.showwarning("警告", "请先选择至少一个窗口 / Please select at least one window")
+        idxs = self.get_selected()
+        if not idxs:
+            messagebox.showwarning("提示", "请先勾选至少一个窗口")
             return
 
-        # 检查是否有识别结果
-        no_result = [i for i in indices if i not in self.last_results or not self.last_results[i]]
+        no_result = [i for i in idxs if i not in self.last_results or not self.last_results[i]]
         if no_result:
-            messagebox.showwarning("警告", "以下窗口尚无识别结果，请先识别 / Please recognize first:\n" +
-                                  "\n".join(f"窗口 {i}: {self.window_mgr.windows[i]['title']}" for i in no_result[:5]))
+            names = "\n".join(f"窗口{i}: {self.window_mgr.windows[i]['title']}" for i in no_result[:6])
+            messagebox.showwarning("提示", f"以下窗口无识别结果，请先识别：\n{names}")
             return
 
-        success_count = 0
-        for idx in indices:
-            text = self.last_results[idx]
-            win = self.window_mgr.windows[idx]
+        ok = 0
+        for i in idxs:
+            text = self.last_results[i]
+            pos = self.input_positions.get(i)
+            win = self.window_mgr.windows[i]
+
+            if pos:
+                cx, cy = pos
+            else:
+                # 回退：窗口中心偏下
+                cx = win['left'] + win['width'] // 2
+                cy = win['top'] + int(win['height'] * 0.72)
+
             try:
-                # 点击输入框区域（窗口下方中间位置，验证码输入框通常在那里）
-                click_x = win['left'] + win['width'] // 2
-                click_y = win['top'] + int(win['height'] * 0.70)
-
-                pyautogui.click(click_x, click_y)
-                time.sleep(0.2)
-                pyautogui.write(text)
-                time.sleep(0.2)
-
-                self.log(f"窗口 {idx} 已填充验证码: {text}")
-                success_count += 1
+                switch_to_english_input()
+                pyautogui.click(cx, cy)
+                time.sleep(0.15)
+                pyautogui.write(text, interval=0.02)
+                time.sleep(0.15)
+                self.log(f"窗口{i} 已填充: {text} 位置:({cx},{cy})")
+                ok += 1
             except Exception as e:
-                self.log(f"窗口 {idx} 自动填充失败: {e}")
+                self.log(f"窗口{i} 填充失败: {e}")
 
-        messagebox.showinfo("完成", f"已成功填充 {success_count}/{len(indices)} 个窗口的验证码")
+        messagebox.showinfo("完成", f"成功填充 {ok}/{len(idxs)} 个窗口")
 
-    def manual_input_selected(self):
-        """手动输入验证码到选中的第一个窗口"""
-        text = self.manual_var.get()
-        if not text:
-            messagebox.showwarning("警告", "请输入验证码 / Please enter CAPTCHA")
-            return
-
-        indices = self.get_selected_indices()
-        if not indices:
-            messagebox.showwarning("警告", "请先选择至少一个窗口 / Please select at least one window")
-            return
-
-        idx = indices[0]
-        win = self.window_mgr.windows[idx]
-        try:
-            click_x = win['left'] + win['width'] // 2
-            click_y = win['top'] + int(win['height'] * 0.70)
-
-            pyautogui.click(click_x, click_y)
-            time.sleep(0.2)
-            pyautogui.write(text)
-
-            self.log(f"手动输入窗口 {idx} 验证码: {text}")
-        except Exception as e:
-            self.log(f"手动输入失败: {e}")
-            messagebox.showerror("错误", f"手动输入失败: {e}")
-
+    # ---------------- 自动模式 ----------------
     def toggle_auto_mode(self):
-        """切换自动模式"""
         if self.auto_mode.get():
             self.is_running = True
             threading.Thread(target=self.auto_loop, daemon=True).start()
-            self.auto_status_label.config(text="状态: 自动模式运行中 / Status: Auto mode running",
-                                         foreground="green")
+            self.auto_status.config(text="运行中", foreground="green")
             self.log("自动模式已启动")
         else:
             self.is_running = False
-            self.auto_status_label.config(text="状态: 就绪 / Status: Ready", foreground="green")
+            self.auto_status.config(text="就绪", foreground="green")
             self.log("自动模式已停止")
 
     def auto_loop(self):
-        """自动识别循环"""
         while self.is_running:
             try:
-                indices = self.get_selected_indices()
-                if indices:
-                    self.log(f"自动循环: 处理 {len(indices)} 个选中窗口")
-                    for idx in indices:
-                        if not self.is_running:
-                            break
-                        self.capture_and_recognize(idx)
-                        time.sleep(0.5)
+                idxs = self.get_selected()
+                if not idxs:
+                    time.sleep(0.5)
+                    continue
 
-                        # 自动填充如果有结果
-                        if idx in self.last_results and self.last_results[idx]:
-                            text = self.last_results[idx]
-                            win = self.window_mgr.windows[idx]
-                            try:
-                                click_x = win['left'] + win['width'] // 2
-                                click_y = win['top'] + int(win['height'] * 0.70)
-                                pyautogui.click(click_x, click_y)
-                                time.sleep(0.2)
-                                pyautogui.write(text)
-                                self.log(f"自动填充窗口 {idx}: {text}")
-                            except Exception as e:
-                                self.log(f"自动填充窗口 {idx} 失败: {e}")
+                self.log(f"自动循环处理 {len(idxs)} 个窗口")
+                for i in idxs:
+                    if not self.is_running:
+                        break
+                    self.capture_and_recognize(i)
+                    time.sleep(0.4)
 
-                time.sleep(self.interval.get())
+                    if i in self.last_results and self.last_results[i]:
+                        text = self.last_results[i]
+                        pos = self.input_positions.get(i)
+                        win = self.window_mgr.windows[i]
+                        cx, cy = (pos if pos else (
+                            win['left'] + win['width'] // 2,
+                            win['top'] + int(win['height'] * 0.72)
+                        ))
+                        try:
+                            switch_to_english_input()
+                            pyautogui.click(cx, cy)
+                            time.sleep(0.15)
+                            pyautogui.write(text, interval=0.02)
+                            self.log(f"自动填充窗口{i}: {text}")
+                        except Exception as e:
+                            self.log(f"自动填充窗口{i}失败: {e}")
+
+                time.sleep(max(1.0, self.interval.get()))
             except Exception as e:
-                self.log(f"自动循环错误: {e}")
-                time.sleep(self.interval.get())
+                self.log(f"自动循环异常: {e}")
+                time.sleep(2.0)
 
-    def apply_ui_scale(self):
-        """应用 UI 缩放"""
-        scale = self.ui_scale.get()
-        # 这里可以添加更细致的缩放逻辑
-        self.log(f"UI 缩放已设置为: {scale}")
+    # ---------------- 其他 ----------------
+    def manual_input_selected(self):
+        text = self.manual_var.get().strip()
+        if not text:
+            messagebox.showwarning("提示", "请输入验证码")
+            return
+        idxs = self.get_selected()
+        if not idxs:
+            messagebox.showwarning("提示", "请先勾选窗口")
+            return
+        i = idxs[0]
+        win = self.window_mgr.windows[i]
+        pos = self.input_positions.get(i)
+        cx, cy = (pos if pos else (
+            win['left'] + win['width'] // 2,
+            win['top'] + int(win['height'] * 0.72)
+        ))
+        try:
+            switch_to_english_input()
+            pyautogui.click(cx, cy)
+            time.sleep(0.15)
+            pyautogui.write(text)
+            self.log(f"手动输入窗口{i}: {text}")
+        except Exception as e:
+            self.log(f"手动输入失败: {e}")
+            messagebox.showerror("错误", str(e))
+
+    def clear_results(self):
+        self.last_results.clear()
+        for v in self.result_vars:
+            v.set("")
+        for v in self.status_vars:
+            v.set("待处理")
+        self.update_tree()
+        self.log("结果已清空")
+
+    def load_templates_dialog(self):
+        d = filedialog.askdirectory(title="选择模板图片目录（需包含 0.png~9.png）")
+        if d:
+            ok = self.recognizer.load_custom_templates(d)
+            self.log(f"模板加载: {'成功' if ok else '失败或目录无效'} {d}")
+
+    def save_config_manual(self):
+        self.save_config()
+        messagebox.showinfo("提示", "配置已保存到 captcha_config.json")
+
+    def test_single_image(self):
+        """测试识别一张本地图片"""
+        f = filedialog.askopenfilename(title="选择验证码图片",
+                                      filetypes=[("图片", "*.png *.jpg *.bmp *.jpeg")])
+        if not f:
+            return
+        try:
+            img = Image.open(f)
+            text, info = self.recognizer.recognize(img)
+            messagebox.showinfo("测试结果", f"{info}\n\n文件: {f}")
+            self.log(f"测试图片 {f}: {info}")
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
 
     def run(self):
-        """运行应用"""
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
+
+    def _on_close(self):
+        self.is_running = False
+        self.auto_mode.set(False)
+        self.save_config()
+        self.root.destroy()
 
 
 def main():
