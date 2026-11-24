@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-雷电模拟器验证码自动识别 - 纯 Windows API 版本
-不依赖 pygetwindow，避免 ctypes LP_RECT 错误
+雷电模拟器验证码自动识别 - 纯 Windows API 版 (支持子窗口枚举)
+不依赖 pygetwindow，支持枚举父窗口下的子模拟器窗口
 """
 
 import tkinter as tk
@@ -28,6 +28,10 @@ kernel32 = ctypes.windll.kernel32
 EnumWindows = user32.EnumWindows
 EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
 EnumWindows.restype = wintypes.BOOL
+
+EnumChildWindows = user32.EnumChildWindows
+EnumChildWindows.argtypes = [wintypes.HWND, ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+EnumChildWindows.restype = wintypes.BOOL
 
 GetWindowRect = user32.GetWindowRect
 GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
@@ -118,13 +122,14 @@ def get_title(hwnd):
         return ""
 
 class WindowInfo:
-    def __init__(self, hwnd, title, left, top, width, height):
+    def __init__(self, hwnd, title, left, top, width, height, parent_hwnd=0):
         self.hwnd = hwnd
         self.title = title
         self.left = left
         self.top = top
         self.width = width
         self.height = height
+        self.parent_hwnd = parent_hwnd
 
 class WindowEnumerator:
     def __init__(self):
@@ -134,21 +139,22 @@ class WindowEnumerator:
         self.custom_titles = []
         self.ldplayer_path = ""
     
-    def enum_callback(self, hwnd, lParam):
+    def _check_window(self, hwnd, parent_hwnd=0):
+        """检查单个窗口是否匹配"""
         try:
             if not IsWindowVisible(hwnd):
-                return True
+                return False
             if IsIconic(hwnd):
-                return True
+                return False
             title = get_title(hwnd)
             if not title:
-                return True
+                return False
             rect = get_rect(hwnd)
             if rect is None:
-                return True
+                return False
             left, top, width, height = rect
             if width <= 0 or height <= 0:
-                return True
+                return False
             title_lower = title.lower()
             matched = any(kw in title_lower for kw in self.keywords)
             if not matched and title in self.custom_titles:
@@ -166,14 +172,29 @@ class WindowEnumerator:
                             matched = True
                     CloseHandle(hproc)
             if matched:
-                self.windows.append(WindowInfo(hwnd, title, left, top, width, height))
+                self.windows.append(WindowInfo(hwnd, title, left, top, width, height, parent_hwnd))
+            return True
+        except Exception:
+            return True
+    
+    def _enum_child_callback(self, hwnd, lParam):
+        self._check_window(hwnd, lParam)
+        return True
+    
+    def _enum_top_callback(self, hwnd, lParam):
+        # 先检查顶级窗口本身
+        self._check_window(hwnd, 0)
+        # 然后枚举该顶级窗口的子窗口
+        try:
+            child_callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(self._enum_child_callback)
+            EnumChildWindows(hwnd, child_callback, hwnd)
         except Exception:
             pass
         return True
     
     def refresh(self):
         self.windows = []
-        callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(self.enum_callback)
+        callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(self._enum_top_callback)
         EnumWindows(callback, 0)
         self.windows.sort(key=lambda w: w.hwnd)
         return self.windows
@@ -307,7 +328,7 @@ class DigitRecognizer:
 class CaptchaRecognizerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("雷电验证码自动识别 - 纯 Windows API 版")
+        self.root.title("雷电验证码自动识别 - 支持子窗口枚举版")
         self.root.geometry("1300x850")
         self.root.resizable(True, True)
         
@@ -364,7 +385,7 @@ class CaptchaRecognizerApp:
         main.columnconfigure(0, weight=1)
         main.rowconfigure(3, weight=1)
         
-        ttk.Label(main, text="雷电模拟器验证码自动识别 - 纯 Windows API 版",
+        ttk.Label(main, text="雷电模拟器验证码自动识别 - 支持子窗口枚举版",
                  font=('Microsoft YaHei', 15, 'bold')).grid(row=0, column=0, pady=(5, 8))
         
         row_ld = ttk.LabelFrame(main, text="雷电安装路径设置", padding="6")
@@ -505,7 +526,7 @@ class CaptchaRecognizerApp:
             self.tree.insert('', tk.END, iid=str(hwnd), values=(
                 '☑' if var.get() else '☐', hwnd, w.title, pos, size, '', '待处理', ip
             ))
-        self.log(f"检测到 {len(wins)} 个模拟器窗口")
+        self.log(f"检测到 {len(wins)} 个模拟器窗口（含子窗口）")
         if not wins:
             messagebox.showinfo("提示", "未检测到任何模拟器窗口。\n请确保模拟器已启动且窗口可见。")
     
